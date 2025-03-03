@@ -1161,8 +1161,8 @@ if __name__ == "__main__":
         "num_filters": tune.choice([96, 128, 160, 192]),
         "dropout": tune.uniform(0.15, 0.3),
         "num_epochs": tune.choice([10, 15, 20, 25]),
-        "batch_size": tune.choice([128, 256, 512]),
-        "optimizer": tune.choice(["adamw", "rmsprop"]),
+        "batch_size": tune.choice([64]),
+        "optimizer": tune.choice(["adamw"]),
         }
 
     if DEBUG_MODE:
