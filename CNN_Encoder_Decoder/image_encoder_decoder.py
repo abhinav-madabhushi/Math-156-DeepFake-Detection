@@ -39,6 +39,7 @@ Pierce Ohlmeyer-Dawson
 import os
 import sys
 import random
+import tempfile
 
 # Third-Party Libraries
 import numpy as np
@@ -61,6 +62,7 @@ from torchvision.transforms import transforms
 from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 from ray.air import session
+from ray.train import Checkpoint
 
 # Scikit-Learn (Evaluation Metrics)
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
@@ -177,7 +179,7 @@ class FocalLoss(nn.Module):
                 - `"none"`: Returns the unaggregated loss tensor.
         """
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-        pt = torch.exp(-bce_loss)  # p_t is the predicted probability
+        pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
 
         if self.reduction == "mean":
@@ -309,12 +311,12 @@ class CNNModel(nn.Module):
 
         self.conv1 = nn.Conv2d(3, num_filters, kernel_size=3, padding=1)
         self.silu1 = nn.SiLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # Downsampling
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv2 = nn.Conv2d(num_filters, num_filters * 2, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(num_filters * 2)
         self.silu2 = nn.SiLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # Further downsampling
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         last_conv_layer = self.conv2
         last_conv_layer.register_full_backward_hook(self._save_gradient_hook)
@@ -389,7 +391,6 @@ class CNNModel(nn.Module):
         global_features = self.global_pool(x).flatten(start_dim=1)
         class_output = self.classifier(global_features)
 
-        # Ensure skip connection has the correct number of channels
         if skip_connection.shape[1] != x.shape[1]:
             if skip_connection.shape[1] > x.shape[1]:
                 skip_connection = skip_connection[:, :x.shape[1], :, :].contiguous()
@@ -402,7 +403,6 @@ class CNNModel(nn.Module):
                 padding = torch.zeros(pad_shape, device=skip_connection.device)
                 skip_connection = torch.cat([skip_connection, padding], dim=1)
 
-        # Generate heatmap using decoder or return zeros if disabled
         if not train_decoder:
             heatmap = torch.zeros_like(x[:, :1, :, :])
         else:
@@ -656,8 +656,8 @@ def setup_training_tools(model, config):
 
     This function initializes the training tools required for model optimization, including:
     
-    - **Optimizer:** Adam optimizer with weight decay.
-    - **Learning Rate Scheduler:** StepLR scheduler that decays the learning rate every 5 epochs.
+    - **Optimizer:** Selected based on config (`adamw`, `adam`, `rmsprop`, `sgd`, `nadam`, `adagrad`).
+    - **Learning Rate Scheduler:** StepLR scheduler (customizable in the future).
     - **Loss Functions:** BCEWithLogitsLoss for classification and Focal IoU TV loss for heatmaps.
     - **Gradient Scaler:** Mixed-precision training scaler for efficiency.
 
@@ -666,24 +666,46 @@ def setup_training_tools(model, config):
         config (dict): Dictionary containing training hyperparameters, including:
             - `"learning_rate"` (float): The initial learning rate.
             - `"weight_decay"` (float): Weight decay for regularization.
+            - `"optimizer"` (str): The chosen optimizer.
+            - `"momentum"` (float, optional): Momentum for SGD (if applicable).
 
     Returns:
         tuple: A tuple containing:
-            - optimizer (torch.optim.Optimizer): The Adam optimizer.
+            - optimizer (torch.optim.Optimizer): The selected optimizer.
             - train_scheduler (torch.optim.lr_scheduler.StepLR): The learning rate scheduler.
             - criterion (torch.nn.Module): The binary cross-entropy loss function.
             - focal_criterion (callable): The focal IoU TV loss function.
             - scaler (torch.cuda.amp.GradScaler): The gradient scaler for mixed precision training.
     """
-    optimizer = optim.Adam(
-        model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"]
-    )
+    optimizer_name = config["optimizer"]
+    learning_rate = config["learning_rate"]
+    weight_decay = config["weight_decay"]
+    momentum = config["momentum"]
+
+    if optimizer_name == "adamw":
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "rmsprop":
+        optimizer = optim.RMSprop(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "sgd":
+        optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+    elif optimizer_name == "nadam":
+        optimizer = optim.NAdam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "adagrad":
+        optimizer = optim.Adagrad(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+    print(f"Using optimizer: {optimizer_name} | LR: {learning_rate:.6f} | Weight Decay: {weight_decay:.6f}")
+
     train_scheduler = StepLR(optimizer, step_size=5, gamma=0.1)
 
     criterion = nn.BCEWithLogitsLoss()
     focal_criterion = focal_iou_tv_loss
 
     scaler = torch.amp.GradScaler(enabled=True)
+    
     return optimizer, train_scheduler, criterion, focal_criterion, scaler
 
 
@@ -837,64 +859,57 @@ def evaluate_model(model, dataloader, evaluate_heatmap=False):
 
 
 def train_hyperparam_tuning(config, train_loader=None, val_loader=None):
-    """Train the model using hyperparameter tuning and report validation accuracy.
+    """Train the model using hyperparameter tuning and report validation accuracy."""
 
-    This function trains a CNN model with given hyperparameters, optimizing for 
-    classification accuracy. It uses mixed-precision training, evaluates the model 
-    on a validation set, and tracks the best-performing model.
-
-    Args:
-        config (dict): Dictionary containing hyperparameters, including:
-            - `"num_filters"` (int): Number of filters in the first convolutional layer.
-            - `"dropout"` (float): Dropout rate for the classifier.
-            - `"learning_rate"` (float): Learning rate for the optimizer.
-            - `"weight_decay"` (float): Weight decay (L2 regularization) for the optimizer.
-            - `"num_epochs"` (int): Total number of training epochs.
-        train_loader (torch.utils.data.DataLoader, optional): DataLoader for the training dataset.
-        val_loader (torch.utils.data.DataLoader, optional): DataLoader for the validation dataset.
-
-    Returns:
-        None: The function does not return a value but reports validation accuracy 
-        using `session.report()`.
-    """
     model_instance = CNNModel(num_filters=config["num_filters"],
                               dropout=config["dropout"]).to(DEVICE)
 
-    if config["optimizer"] == "adamw":
-        optimizer = optim.AdamW(model_instance.parameters(), 
-                                lr=config["learning_rate"], 
-                                weight_decay=config["weight_decay"])
-    elif config["optimizer"] == "adam":
-        optimizer = optim.Adam(model_instance.parameters(), 
-                            lr=config["learning_rate"], 
-                            weight_decay=config["weight_decay"])
-    elif config["optimizer"] == "rmsprop":
-        optimizer = optim.RMSprop(model_instance.parameters(), 
-                                lr=config["learning_rate"], 
-                                weight_decay=config["weight_decay"])
-    elif config["optimizer"] == "sgd":
-        optimizer = optim.SGD(model_instance.parameters(), 
-                            lr=config["learning_rate"], 
-                            momentum=0.9, 
-                            weight_decay=config["weight_decay"])
-    elif config["optimizer"] == "nadam":
-        optimizer = optim.NAdam(model_instance.parameters(), 
-                                lr=config["learning_rate"], 
-                                weight_decay=config["weight_decay"])
-    elif config["optimizer"] == "adagrad":
-        optimizer = optim.Adagrad(model_instance.parameters(), 
-                                lr=config["learning_rate"], 
-                                weight_decay=config["weight_decay"])
+    optimizer_name = config["optimizer"]
+    learning_rate = config["learning_rate"]
+    weight_decay = config["weight_decay"]
+    momentum = config["momentum"]
+
+    if optimizer_name == "adamw":
+        optimizer = optim.AdamW(model_instance.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "adam":
+        optimizer = optim.Adam(model_instance.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "rmsprop":
+        optimizer = optim.RMSprop(model_instance.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "sgd":
+        optimizer = optim.SGD(model_instance.parameters(), lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+    elif optimizer_name == "nadam":
+        optimizer = optim.NAdam(model_instance.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == "adagrad":
+        optimizer = optim.Adagrad(model_instance.parameters(), lr=learning_rate, weight_decay=weight_decay)
     else:
-        raise ValueError(f"Unknown optimizer: {config['optimizer']}")
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+    print(f"Using optimizer: {optimizer_name} | LR: {learning_rate:.6f} | Weight Decay: {weight_decay:.6f}")
+
     criterion = nn.BCEWithLogitsLoss()
     focal_criterion = focal_iou_tv_loss
     scaler = torch.amp.GradScaler(enabled=True)
 
+    checkpoint = session.get_checkpoint()
     best_val_acc = 0.0
+    start_epoch = 0
 
-    for epoch in range(config["num_epochs"]):
+    checkpoint_dir_name = "./checkpoints"
+    os.makedirs(checkpoint_dir_name, exist_ok=True)
+
+    checkpoint_path = os.path.join(checkpoint_dir_name, "checkpoint.pth")
+
+    if checkpoint:
+        checkpoint_data = checkpoint.to_dict()
+        model_instance.load_state_dict(checkpoint_data["model_state_dict"])
+        optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+        best_val_acc = checkpoint_data.get("best_val_acc", 0.0)
+        start_epoch = checkpoint_data.get("epoch", 0) + 1
+        print(f"🔄 Resuming training from epoch {start_epoch}, best val_acc: {best_val_acc:.2f}")
+
+    for epoch in range(start_epoch, config["num_epochs"]):
         model_instance.train()
+        running_loss = 0.0
 
         for images, labels in train_loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE).float().unsqueeze(1)
@@ -903,11 +918,15 @@ def train_hyperparam_tuning(config, train_loader=None, val_loader=None):
             with torch.amp.autocast(device_type=DEVICE, dtype=torch.float16, enabled=True):
                 class_output, heatmap = model_instance(images, train_decoder=False)
                 loss = criterion(class_output, labels) + 0.5 * focal_criterion(
-                    heatmap, labels.view(-1, 1, 1, 1).expand_as(heatmap))
+                    heatmap, labels.view(-1, 1, 1, 1).expand_as(heatmap)
+                )
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            running_loss += loss.item()
+
+        avg_train_loss = running_loss / len(train_loader)
 
         model_instance.eval()
         correct, total = 0, 0
@@ -915,21 +934,31 @@ def train_hyperparam_tuning(config, train_loader=None, val_loader=None):
             for images, labels in val_loader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE).float().unsqueeze(1)
                 class_output, _ = model_instance(images, train_decoder=False)
-                correct += (torch.sigmoid(class_output).round() == labels).sum().item()
+                predictions = torch.sigmoid(class_output).round()
+                correct += (predictions == labels).sum().item()
                 total += labels.size(0)
 
         val_acc = 100 * correct / total
-        print(f"Epoch [{epoch + 1}/{config['num_epochs']}], Validation Accuracy: {val_acc:.2f}%")
+        print(f"Epoch [{epoch + 1}/{config['num_epochs']}], Validation Accuracy: {val_acc:.2f}%, Training Loss: {avg_train_loss:.6f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            checkpoint_dir = session.get_checkpoint()
-            if checkpoint_dir:
-                checkpoint_path = os.path.join(checkpoint_dir, "best_model.pth")
-                torch.save(model_instance.state_dict(), checkpoint_path)
-                print(f"Checkpoint saved: {checkpoint_path}")
 
-        session.report({"val_acc": val_acc, "train_loss": loss.item(), "epoch": epoch})
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model_instance.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_val_acc": best_val_acc
+            }, checkpoint_path)
+
+            checkpoint = Checkpoint.from_directory(checkpoint_dir_name)
+
+            session.report(
+                {"val_acc": val_acc, "train_loss": avg_train_loss, "epoch": epoch},
+                checkpoint=checkpoint
+            )
+        else:
+            session.report({"val_acc": val_acc, "train_loss": avg_train_loss, "epoch": epoch})
 
 
 def evaluate_model_with_metrics(model, dataloader, evaluate_heatmap=False):
@@ -1154,15 +1183,27 @@ if __name__ == "__main__":
          drop_last=True
     )
 
-
     search_space = {
-        "learning_rate": tune.loguniform(5e-4, 3e-3),
-        "weight_decay": tune.loguniform(1e-5, 1e-4),
-        "num_filters": tune.choice([96, 128, 160, 192]),
-        "dropout": tune.uniform(0.15, 0.3),
-        "num_epochs": tune.choice([10, 15, 20, 25]),
-        "batch_size": tune.choice([64]),
-        "optimizer": tune.choice(["adamw"]),
+        "optimizer": tune.choice(["adamw", "adam", "rmsprop", "sgd", "nadam", "adagrad"]),
+
+        "learning_rate": tune.sample_from(
+            lambda config: float(np.random.uniform(5e-4, 3e-3)) if config["optimizer"] in ["adamw", "adam", "nadam"]
+            else float(np.random.uniform(1e-4, 2e-3)) if config["optimizer"] == "rmsprop"
+            else float(np.random.uniform(5e-4, 1e-2)) if config["optimizer"] == "sgd"
+            else float(np.random.uniform(1e-3, 5e-3))
+        ),
+
+        "weight_decay": tune.loguniform(1e-6, 1e-3),  
+
+        "num_filters": tune.choice([64, 96, 128, 160, 192]),  
+
+        "dropout": tune.uniform(0.05, 0.5),  
+
+        "num_epochs": tune.choice([10, 15, 20, 25, 30, 50]),
+
+        "momentum": tune.sample_from(
+    lambda config: float(np.random.uniform(0.6, 0.98)) if config["optimizer"] == "sgd" else 0.0)
+
         }
 
     if DEBUG_MODE:
@@ -1173,6 +1214,7 @@ if __name__ == "__main__":
             "num_epochs": 5,
             "weight_decay": 1e-4,
             "batch_size": 16,
+            "optimizer": "adamw",
         }
         print("Debug mode ON: Skipping hyperparameter tuning. Using fixed config:", best_config)
 
@@ -1183,7 +1225,8 @@ if __name__ == "__main__":
             max_t=25,
             grace_period=5,
             reduction_factor=3
-            )
+        )
+
         tuner = tune.run(
             tune.with_parameters(
                 train_hyperparam_tuning,
@@ -1191,50 +1234,48 @@ if __name__ == "__main__":
                 val_loader=val_data_loader
             ),
             config=search_space,
-            num_samples=50,
+            num_samples=1000,
             scheduler=scheduler,
-            resources_per_trial={"cpu": 4, "gpu": 0.25},
-            max_concurrent_trials=0
-            )
+            resources_per_trial={"cpu": 4, "gpu": 0.1},
+            storage_path=os.path.abspath("./ray_results"),
+            name="train_hyperparam_tuning",
+            checkpoint_score_attr="val_acc",
+            resume="Auto"
+        )
 
         best_trial = tuner.get_best_trial("val_acc", "max", "last")
-        best_config = best_trial.config  # Extract best hyperparameters
+        best_config = best_trial.config
         print("Hyperparameter tuning complete. Best config:", best_config)
 
-        best_checkpoint = best_trial.checkpoint
+        best_checkpoint = tuner.get_best_checkpoint(best_trial, metric="val_acc", mode="max")
+
+        best_model = CNNModel(
+            num_filters=best_config["num_filters"],
+            dropout=best_config["dropout"]
+        ).to(DEVICE)
+
         if best_checkpoint:
-            best_model_path = os.path.join(best_checkpoint.to_directory(), "best_model.pth")
-            best_model = CNNModel(
-                num_filters=best_config["num_filters"],
-                dropout=best_config["dropout"]
-            ).to(DEVICE)
-            best_model.load_state_dict(torch.load(best_model_path))
+            best_model_path = os.path.join(best_checkpoint.to_directory(), "checkpoint.pth")
 
-            print(f"Loaded best model from checkpoint: {best_model_path}")
+            if os.path.exists(best_model_path):
+                print(f"Loading best model from {best_model_path}")
+                checkpoint = torch.load(best_model_path)
+                best_model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                best_checkpoint = None
 
-        else:
-            print("Warning: No checkpoint found for best trial. Training model again.")
-
+        if best_checkpoint is None:
+            print("No valid checkpoint found. Training model again.")
             best_model_state_dict, _ = train_model(
-                CNNModel(
-                    num_filters=best_config["num_filters"],
-                    dropout=best_config["dropout"]
-                ).to(DEVICE),
+                best_model,
                 train_loader=train_data_loader,
                 val_loader=val_data_loader,
                 config=best_config
-                )
-
-            best_model = CNNModel(
-                num_filters=best_config["num_filters"],
-                dropout=best_config["dropout"]
-            ).to(DEVICE)
+            )
             best_model.load_state_dict(best_model_state_dict)
 
         best_model.eval()
-
         test_metrics = evaluate_model_with_metrics(best_model, test_data_loader)
-
 
     best_model, best_val_acc = train_model(
         CNNModel(
