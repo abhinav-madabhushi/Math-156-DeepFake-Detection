@@ -39,7 +39,7 @@ Pierce Ohlmeyer-Dawson
 import os
 import sys
 import random
-import tempfile
+import json
 
 # Third-Party Libraries
 import numpy as np
@@ -1043,30 +1043,31 @@ def evaluate_model_with_metrics(model, dataloader, evaluate_heatmap=False):
     return image_metrics
 
 
-def visualize_with_gradcam(model, img_path, img_transform, colormap="jet", alpha_intensity=0.6):
-    """Overlay a Grad-CAM heatmap on the original image and display classification results.
+def visualize_with_gradcam(model, img_path, img_transform, colormap="jet_r", alpha_intensity=0.6):
+    """Overlay a Grad-CAM heatmap and decoder heatmap on the original image and display classification results.
 
-    This function computes the Grad-CAM heatmap for an input image, overlays it onto the 
-    original image, and displays both the original image and the Grad-CAM visualization 
-    with classification results.
+    Enhancements:
+        - Uses CLAHE to enhance the decoder heatmap contrast.
+        - Ensures proper normalization of both heatmaps.
+        - Provides clear visual overlays.
 
     Args:
         model (torch.nn.Module): The trained CNN model for classification.
         img_path (str): Path to the input image.
         img_transform (callable): Transformation function to preprocess the image.
-        colormap (str, optional): Colormap for the Grad-CAM heatmap overlay. Default is "jet".
-        alpha_intensity (float, optional): Weighting factor for blending the heatmap with 
+        colormap (str, optional): Colormap for the Grad-CAM and decoder heatmap overlays. Default is "jet".
+        alpha_intensity (float, optional): Weighting factor for blending the heatmaps with 
             the original image. Default is 0.6.
 
     Returns:
-        None: Displays the original image and the Grad-CAM heatmap overlay using Matplotlib.
+        None: Displays the original image, the Grad-CAM heatmap overlay, and the decoder heatmap overlay.
     """
     model.eval()
     original_img = Image.open(img_path).convert("RGB")
     input_tensor = img_transform(original_img).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        class_output, _ = model(input_tensor, train_decoder=False)
+        class_output, decoder_heatmap = model(input_tensor, train_decoder=True)
         probability = torch.sigmoid(class_output).item()
 
     predicted_class = "Real" if probability >= 0.5 else "Fake"
@@ -1074,39 +1075,55 @@ def visualize_with_gradcam(model, img_path, img_transform, colormap="jet", alpha
 
     gradcam_heatmap = compute_gradcam(model, input_tensor)
 
-    if isinstance(gradcam_heatmap, torch.Tensor):
-        gradcam_heatmap = gradcam_heatmap.squeeze().detach().cpu().numpy()
+    def process_heatmap(heatmap, img_shape, enhance_contrast=False):
+        """Preprocesses heatmap: normalizes, resizes, and optionally enhances contrast."""
+        if isinstance(heatmap, torch.Tensor):
+            heatmap = heatmap.squeeze().detach().cpu().numpy()
+        if heatmap.ndim > 2:
+            heatmap = np.mean(heatmap, axis=0)  # Average across channels if needed
 
-    if gradcam_heatmap.ndim > 2:
-        gradcam_heatmap = np.mean(gradcam_heatmap, axis=0)
+        heatmap = cv2.resize(heatmap, img_shape)
 
-    gradcam_heatmap = cv2.resize(gradcam_heatmap, (original_img.width, original_img.height))
+        # Normalize to [0,1]
+        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-7)
 
-    gradcam_heatmap = (
-        gradcam_heatmap - gradcam_heatmap.min()) / (
-        gradcam_heatmap.max() - gradcam_heatmap.min() + 1e-7
-    )
+        # Apply CLAHE for decoder heatmap if enhance_contrast=True
+        if enhance_contrast:
+            heatmap = np.uint8(255 * heatmap)  # Convert to 8-bit
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            heatmap = clahe.apply(heatmap)  # Apply CLAHE
+            heatmap = heatmap / 255.0  # Convert back to [0,1]
 
+        return plt.get_cmap(colormap)(heatmap)[..., :3]  # Apply colormap and remove alpha channel
+
+    # Convert original image to NumPy for overlay blending
     original_img = np.array(original_img, dtype=np.float64) / 255.0
 
-    heatmap_colored = plt.get_cmap(colormap)(gradcam_heatmap)[..., :3]
+    # Process both Grad-CAM and decoder heatmaps
+    gradcam_overlay = (1 - alpha_intensity) * original_img + alpha_intensity * process_heatmap(
+        gradcam_heatmap, (original_img.shape[1], original_img.shape[0])
+    )
 
-    if heatmap_colored.shape[:2] != original_img.shape[:2]:
-        heatmap_colored = cv2.resize(
-            heatmap_colored,
-            (original_img.shape[1], original_img.shape[0])
-            )
+    decoder_overlay = (1 - alpha_intensity) * original_img + alpha_intensity * process_heatmap(
+        decoder_heatmap.squeeze().cpu().numpy(), (original_img.shape[1], original_img.shape[0]), enhance_contrast=True
+    )
 
-    overlay = (1 - alpha_intensity) * original_img + alpha_intensity * heatmap_colored
+    # Debugging: Print heatmap values
+    print("Decoder Heatmap After Enhancement:\n", decoder_heatmap)
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    # Display results
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
     ax[0].imshow(original_img)
     ax[0].set_title("Original Image")
     ax[0].axis("off")
 
-    ax[1].imshow(overlay)
+    ax[1].imshow(gradcam_overlay)
     ax[1].set_title(f"Grad-CAM Heatmap\nPrediction: {predicted_class} ({confidence:.2%})")
     ax[1].axis("off")
+
+    ax[2].imshow(decoder_overlay)
+    ax[2].set_title("Enhanced Decoder Heatmap (CLAHE Applied)")
+    ax[2].axis("off")
 
     fig.tight_layout()
     plt.show()
@@ -1116,39 +1133,67 @@ if __name__ == "__main__":
     LABELS_CSV = "/home/pie_crusher/CNN_AI_REAL/labels.csv"
     IMAGE_DIRECTORY = "/home/pie_crusher/CNN_AI_REAL/image_directory"
 
-    # If `--skip-main` is provided, load the model and perform inference
+    # Check if --skip-main is present
     if "--skip-main" in sys.argv:
-        CHECKPOINT_PATH = "/home/pie_crusher/CNN_AI_REAL/best_cnn_real_fake.pth"
-        IMAGE_DIR = "/home/pie_crusher/CNN_AI_REAL/image_directory"
+        # Get argument values by finding named argument indices
+        try:
+            checkpoint_index = sys.argv.index("--checkpoint-path") + 1
+            params_index = sys.argv.index("--params-path") + 1
 
-        if not os.path.exists(CHECKPOINT_PATH):
-            print(f"Error: Checkpoint file {CHECKPOINT_PATH} not found.")
+            CHECKPOINT_PATH = sys.argv[checkpoint_index]
+            PARAMS_PATH = sys.argv[params_index]
+        except (ValueError, IndexError):
+            print("Error: Missing required arguments. Usage:")
+            print("python image_encoder_decoder.py --skip-main --checkpoint-path <checkpoint_path> --params-path <params_path>")
             sys.exit(1)
 
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        # Validate file paths
+        if not os.path.exists(CHECKPOINT_PATH):
+            print(f"Error: Checkpoint file '{CHECKPOINT_PATH}' not found.")
+            sys.exit(1)
 
-        best_config = checkpoint["config"]
+        if not os.path.exists(PARAMS_PATH):
+            print(f"Error: Params file '{PARAMS_PATH}' not found.")
+            sys.exit(1)
+
+        # Load hyperparameters from params.json
+        with open(PARAMS_PATH, "r") as f:
+            best_config = json.load(f)
+
+        # Extract model configuration
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Initialize model following the provided template
         cnn_model = CNNModel(
-            num_filters=best_config["num_filters"], dropout=best_config["dropout"]
+            num_filters=best_config["num_filters"], 
+            dropout=best_config["dropout"]
         ).to(DEVICE)
+
+        # Load model weights from the fine-tuned checkpoint
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
         cnn_model.load_state_dict(checkpoint["model_state_dict"])
         cnn_model.eval()
 
-        print(f"Loaded trained model with validation accuracy: {checkpoint['val_acc']:.2f}%")
+        print(f"Loaded fine-tuned model from: {CHECKPOINT_PATH}")
+        print(f"Validation Accuracy: {checkpoint.get('val_acc', 'N/A'):.2f}%")
 
+        # Select a random image for testing
+        IMAGE_DIR = "/home/pie_crusher/CNN_AI_REAL/image_directory"
         image_files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith((".jpg"))]
         if not image_files:
             print(f"Error: No images found in {IMAGE_DIR}")
             sys.exit(1)
 
         TEST_IMAGE_PATH = os.path.join(IMAGE_DIR, random.choice(image_files))
+#        TEST_IMAGE_PATH = 'fake.jpg' #Custom Image Path
         print(f"Selected Random Image: {TEST_IMAGE_PATH}")
 
+        # Perform Grad-CAM visualization
         visualize_with_gradcam(
-            cnn_model, TEST_IMAGE_PATH, transform, colormap="magma", alpha_intensity=0.9
+            cnn_model, TEST_IMAGE_PATH, inference_transform, colormap="jet_r", alpha_intensity=0.9
         )
 
-        sys.exit(0)
+        sys.exit(0)  # Exit after inference is complete
 
 
     dataset = CustomDataset(LABELS_CSV, IMAGE_DIRECTORY, image_transform=transform)
