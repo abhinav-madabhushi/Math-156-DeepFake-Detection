@@ -1,0 +1,9 @@
+{
+  "dropout": 0.19190778357747784,
+  "learning_rate": 0.002432736042627349,
+  "momentum": 0.0,
+  "num_epochs": 30,
+  "num_filters": 192,
+  "optimizer": "adamw",
+  "weight_decay": 6.306866710760929e-05
+}
