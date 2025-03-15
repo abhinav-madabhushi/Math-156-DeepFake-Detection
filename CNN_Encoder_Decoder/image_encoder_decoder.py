@@ -1,38 +1,38 @@
 """
 Image Encoder-Decoder Module for AI-Generated Image Detection.
 
-This module implements a convolutional neural network (CNN) model with a 
-UNet-style decoder for AI-generated image classification and heatmap visualization 
-using Grad-CAM. It includes functions for training, evaluation, hyperparameter 
-tuning, and Grad-CAM visualization.
+This module implements a convolutional neural network (CNN) with a UNet-style decoder 
+to classify AI-generated images and visualize activations using Grad-CAM. It includes 
+functions for model training, evaluation, hyperparameter tuning, and result visualization.
 
 Main Features:
----------------
-- **CustomDataset**: A PyTorch dataset class for loading images and labels from a CSV file.
+--------------
+- **CustomDataset**: PyTorch dataset class for loading images and labels from a CSV file.
 - **CNNModel**: A convolutional neural network with Grad-CAM support and a UNet-style decoder.
-- **UNetDecoder**: A decoder that progressively upsamples feature maps and incorporates skip connections.
-- **FocalLoss**: A custom loss function to handle class imbalance.
-- **Grad-CAM Visualization**: Functions to compute and overlay Grad-CAM heatmaps.
+- **UNetDecoder**: Decoder that progressively upsamples feature maps and incorporates skip connections.
+- **FocalLoss**: Custom loss function designed to handle class imbalance.
+- **Grad-CAM Visualization**: Computes and overlays Grad-CAM heatmaps for model interpretability.
 - **Hyperparameter Tuning**: Uses Ray Tune for automatic model tuning.
-- **Early Stopping & Checkpointing**: Implements training checkpoints and early stopping.
+- **Early Stopping & Checkpointing**: Implements training checkpoints and early stopping mechanisms.
 - **Evaluation Metrics**: Computes accuracy, precision, recall, F1-score, IoU, and Dice score.
+- **Principal Component Analysis (PCA)**: Visualizes feature distributions using PCA.
 
 Dependencies:
---------------
-This module requires the following libraries:
-- `torch`, `torchvision`
-- `numpy`, `pandas`
-- `opencv-python` (`cv2`)
-- `ray[tune]`
-- `scikit-learn` (`sklearn.metrics`)
-- `PIL` (Pillow)
-- `matplotlib`
+-------------
+This module requires the following Python libraries:
+- **Deep Learning**: `torch`, `torchvision`
+- **Data Processing**: `numpy`, `pandas`
+- **Image Processing**: `opencv-python` (`cv2`), `PIL` (Pillow)
+- **Visualization**: `matplotlib`, `seaborn` (optional)
+- **Hyperparameter Tuning**: `ray[tune]`
+- **Evaluation Metrics**: `scikit-learn` (`sklearn.metrics`)
+- **Dimensionality Reduction**: `sklearn.decomposition.PCA`
 
-For usage examples and setup instructions, refer to the **README** file.
+For usage examples, refer to the **README** file.
 
 Author:
---------
-Pierce Ohlmeyer-Dawson
+-------
+Pierce Ohlmeyer-Dawson and Abhinav Madabhushi
 """
 
 # Standard Library
@@ -65,7 +65,8 @@ from ray.air import session
 from ray.train import Checkpoint
 
 # Scikit-Learn (Evaluation Metrics)
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.decomposition import PCA
 
 #If DEBUG_MODE is TRUE, it will skip hyperparameter tuning
 DEBUG_MODE = False
@@ -74,22 +75,22 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 transform = transforms.Compose([
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2,
-                           saturation=0.2, hue=0.1),
+    transforms.RandomHorizontalFlip(),  # Augment with random flips
+    transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),  # Small geometric distortions
+    transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),  # Adjust color properties
     transforms.ToTensor(),
     transforms.ConvertImageDtype(torch.float),
-    transforms.Resize((32, 32)),
-    transforms.Normalize(mean=[0.5], std=[0.5])
+    transforms.Resize((32, 32)),  
+    transforms.Normalize([0.5], [0.5])  # Center pixel values around 0
 ])
 
 inference_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.ConvertImageDtype(torch.float),
     transforms.Resize((32, 32)),
-    transforms.Normalize(mean=[0.5], std=[0.5])
+    transforms.Normalize([0.5], [0.5])
 ])
+
 
 
 class CustomDataset(Dataset):
@@ -499,6 +500,30 @@ def compute_losses(class_output, heatmap, labels, loss_params):
     heatmap_loss = focal_iou_tv_loss(heatmap, pixel_labels)
     return class_loss + 0.5 * heatmap_loss
 
+def evaluate_val_loss(model, dataloader, criterion):
+    """Evaluate validation loss over the dataset.
+
+    Runs the model in evaluation mode without updating gradients and computes 
+    the average loss across the validation set.
+
+    Args:
+        model (torch.nn.Module): The trained model.
+        dataloader (torch.utils.data.DataLoader): DataLoader for validation data.
+        criterion (callable): Loss function used for evaluation.
+
+    Returns:
+        float: The average validation loss.
+    """
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE).float().unsqueeze(1)
+            class_output, _ = model(images, train_decoder=False)
+            loss = criterion(class_output, labels)
+            total_loss += loss.item()
+    return total_loss / len(dataloader)
+
 
 def train_model(model_instance, train_loader, val_loader, config):
     """Train the CNN model with staged training and early stopping.
@@ -519,10 +544,11 @@ def train_model(model_instance, train_loader, val_loader, config):
             - `"num_epochs"` (int): Total number of training epochs.
             - `"tv_loss_weight"` (float, optional): Weight for total variation loss. Defaults to 1.0.
 
-    Returns:
+    Returns:    
         tuple:
-            - best_model_state_dict (dict): The state dictionary of the best-performing model.
-            - best_val_acc (float): The highest validation accuracy achieved during training.
+            - dict: The state dictionary of the best-performing model.
+            - float: The highest validation accuracy achieved during training.
+            - dict: Training history containing loss, accuracy, and segmentation metrics.
     """
     optimizer, train_scheduler, criterion, focal_criterion, scaler = (
         setup_training_tools(model_instance, config)
@@ -541,6 +567,17 @@ def train_model(model_instance, train_loader, val_loader, config):
         "no_improve_epochs": 0
     }
     os.makedirs("checkpoints", exist_ok=True)
+    
+    history = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+        "iou": [],
+        "dice": []
+    }
+
+    
 
     for epoch in range(config["num_epochs"]):
         config["epoch"] = epoch
@@ -559,8 +596,17 @@ def train_model(model_instance, train_loader, val_loader, config):
             iou, dice = heatmap_metrics
         else:
             iou, dice = None, None
-
+        
+        val_loss = evaluate_val_loss(model_instance, val_loader, criterion)
         train_scheduler.step()
+        
+        history["train_loss"].append(train_metrics['loss'])
+        history["train_acc"].append(train_metrics['accuracy'])
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["iou"].append(iou if iou is not None else np.nan)
+        history["dice"].append(dice if dice is not None else np.nan)
+
 
         print(f"Epoch [{epoch + 1}/{config['num_epochs']}] - "
               f"Train Loss: {train_metrics['loss']:.4f} "
@@ -576,32 +622,34 @@ def train_model(model_instance, train_loader, val_loader, config):
             epoch
         ):
             break
+        if val_acc > state["best_val_acc"]:
+            state["best_val_acc"] = val_acc
+            state["best_model"] = model_instance.state_dict()
 
-    return state["best_model"], state["best_val_acc"]
+    return state["best_model"], state["best_val_acc"], history
 
 
 def check_early_stopping(state, model, val_acc, heatmap_acc, epoch):
-    """Check for early stopping and save the best model checkpoint.
+    """Check if training should stop early and save the best model checkpoint.
 
-    This function monitors the validation accuracy (`val_acc`) and heatmap accuracy 
-    (`heatmap_acc`) to determine whether training should stop early. If an improvement 
-    is detected, it updates the best model state and resets the no-improvement counter.
-    If no improvement is observed for a number of consecutive epochs equal to the patience 
-    threshold, early stopping is triggered.
+    This function monitors validation accuracy (`val_acc`) and heatmap accuracy (`heatmap_acc`).
+    If either metric improves, it updates the best model state and resets the no-improvement counter.
+    If no improvement occurs for a consecutive number of epochs equal to the patience threshold, 
+    early stopping is triggered.
 
     Args:
-        state (dict): A dictionary containing:
-            - `"best_val_acc"` (float): The highest recorded validation accuracy.
-            - `"best_model"` (dict): The state dictionary of the best model.
-            - `"patience"` (int): The number of epochs allowed without improvement.
-            - `"no_improve_epochs"` (int): Counter for epochs without improvement.
+        state (dict): A dictionary tracking training progress:
+            - `"best_val_acc"` (float): Highest recorded validation accuracy.
+            - `"best_model"` (dict): Model checkpoint of the best-performing model.
+            - `"patience"` (int): Maximum epochs allowed without improvement.
+            - `"no_improve_epochs"` (int): Consecutive epochs without improvement.
         model (torch.nn.Module): The model being trained.
-        val_acc (float): The current validation accuracy.
-        heatmap_acc (float): The current heatmap accuracy (IoU/Dice score).
-        epoch (int): The current training epoch.
+        val_acc (float): Current validation accuracy.
+        heatmap_acc (float): Current heatmap accuracy (IoU/Dice score).
+        epoch (int): Current training epoch.
 
     Returns:
-        bool: `True` if early stopping is triggered, otherwise `False`.
+        bool: `True` if early stopping is triggered (patience exceeded), otherwise `False`.
     """
     if val_acc > state["best_val_acc"] or heatmap_acc > state["best_val_acc"]:
         state.update({"best_val_acc": val_acc, "best_model": model.state_dict()})
@@ -622,20 +670,22 @@ def focal_iou_tv_loss(preds, targets, alpha=0.25, gamma=2.0, tv_weight=0.01):
     """Compute the combined Focal, IoU, and Total Variation (TV) loss.
 
     This loss function integrates three components:
-    
-    - **Focal Loss:** Mitigates class imbalance by focusing more on hard-to-classify examples.
-    - **IoU Loss:** Measures the intersection-over-union (IoU) between predicted and target masks.
-    - **Total Variation (TV) Loss:** Encourages spatial smoothness in predictions.
+
+    - **Focal Loss:** Reduces the impact of class imbalance by down-weighting easy examples 
+        and focusing more on hard-to-classify cases.
+    - **IoU Loss:** Measures the overlap loss between predicted and target masks, 
+        penalizing low intersection-over-union (IoU).
+    - **Total Variation (TV) Loss:** Promotes spatial smoothness by penalizing local pixel variations.
 
     Args:
-        preds (torch.Tensor): Predicted logits of shape (N, C, H, W).
+        preds (torch.Tensor): Model output logits of shape (N, C, H, W), where C is the number of classes.
         targets (torch.Tensor): Ground truth binary masks of shape (N, C, H, W).
         alpha (float, optional): Focal loss weighting factor for positive samples. Default is 0.25.
         gamma (float, optional): Focal loss focusing parameter. Default is 2.0.
-        tv_weight (float, optional): Weight assigned to the total variation loss. Default is 0.01.
+        tv_weight (float, optional): Weighting factor for total variation loss. Default is 0.01.
 
     Returns:
-        torch.Tensor: The computed loss value (scalar).
+        torch.Tensor: A scalar tensor representing the combined loss value.
     """
     bce = F.binary_cross_entropy_with_logits(preds, targets, reduction="none")
     pt = torch.exp(-bce)
@@ -652,30 +702,33 @@ def focal_iou_tv_loss(preds, targets, alpha=0.25, gamma=2.0, tv_weight=0.01):
 
 
 def setup_training_tools(model, config):
-    """Set up the optimizer, learning rate scheduler, loss functions, and gradient scaler.
+    """Initialize the optimizer, scheduler, loss functions, and gradient scaler.
 
-    This function initializes the training tools required for model optimization, including:
-    
-    - **Optimizer:** Selected based on config (`adamw`, `adam`, `rmsprop`, `sgd`, `nadam`, `adagrad`).
-    - **Learning Rate Scheduler:** StepLR scheduler (customizable in the future).
+    This function sets up essential components for training, including:
+
+    - **Optimizer:** Configurable optimizer (`adamw`, `adam`, `rmsprop`, `sgd`, `nadam`, `adagrad`).
+    - **Learning Rate Scheduler:** StepLR with a decay factor.
     - **Loss Functions:** BCEWithLogitsLoss for classification and Focal IoU TV loss for heatmaps.
-    - **Gradient Scaler:** Mixed-precision training scaler for efficiency.
+    - **Gradient Scaler:** Enables mixed-precision training for efficiency.
 
     Args:
         model (torch.nn.Module): The neural network model being trained.
-        config (dict): Dictionary containing training hyperparameters, including:
-            - `"learning_rate"` (float): The initial learning rate.
-            - `"weight_decay"` (float): Weight decay for regularization.
-            - `"optimizer"` (str): The chosen optimizer.
-            - `"momentum"` (float, optional): Momentum for SGD (if applicable).
+        config (dict): Training configuration parameters:
+            - `"learning_rate"` (float): Initial learning rate.
+            - `"weight_decay"` (float): Regularization weight decay.
+            - `"optimizer"` (str): Name of the optimizer to use.
+            - `"momentum"` (float, optional): Momentum factor (for SGD only).
 
     Returns:
-        tuple: A tuple containing:
-            - optimizer (torch.optim.Optimizer): The selected optimizer.
-            - train_scheduler (torch.optim.lr_scheduler.StepLR): The learning rate scheduler.
-            - criterion (torch.nn.Module): The binary cross-entropy loss function.
-            - focal_criterion (callable): The focal IoU TV loss function.
-            - scaler (torch.cuda.amp.GradScaler): The gradient scaler for mixed precision training.
+        tuple:
+            - torch.optim.Optimizer: Configured optimizer.
+            - torch.optim.lr_scheduler.StepLR: Learning rate scheduler.
+            - torch.nn.Module: Binary cross-entropy loss function.
+            - callable: Focal IoU TV loss function.
+            - torch.cuda.amp.GradScaler: Mixed-precision training scaler.
+
+    Raises:
+        ValueError: If the specified optimizer is not recognized.
     """
     optimizer_name = config["optimizer"]
     learning_rate = config["learning_rate"]
@@ -712,27 +765,29 @@ def setup_training_tools(model, config):
 def train_one_epoch(model, dataloader, optim_params, loss_params, config):
     """Train the model for one epoch and return training metrics.
 
-    This function performs one full pass over the training dataset, optimizing 
+    This function performs a full pass over the training dataset, optimizing 
     the model using mixed-precision training. It calculates the total loss 
     (classification + heatmap loss) and tracks training accuracy.
 
+    Mixed precision is enabled via `torch.amp.autocast` to improve computational efficiency.
+
     Args:
-        model (torch.nn.Module): The neural network model to be trained.
+        model (torch.nn.Module): The neural network model being trained.
         dataloader (torch.utils.data.DataLoader): DataLoader for the training dataset.
-        optim_params (dict): Dictionary containing:
+        optim_params (dict): Dictionary containing optimizer and gradient scaler:
             - `"optimizer"` (torch.optim.Optimizer): The optimizer.
-            - `"scaler"` (torch.cuda.amp.GradScaler): Scaler for mixed precision training.
-        loss_params (dict): Dictionary containing:
+            - `"scaler"` (torch.cuda.amp.GradScaler): Scaler for mixed-precision training.
+        loss_params (dict): Dictionary containing loss functions:
             - `"criterion"` (callable): Classification loss function.
             - `"focal_criterion"` (callable): Heatmap loss function.
-        config (dict): Dictionary containing training configurations, including:
+        config (dict): Training configuration options:
             - `"train_decoder"` (bool, optional): Whether to train the decoder. Defaults to `True`.
             - `"train_encoder"` (bool, optional): Whether to train the encoder. Defaults to `True`.
 
     Returns:
-        dict: A dictionary containing:
-            - `"loss"` (float): The average training loss for the epoch.
-            - `"accuracy"` (float): The training accuracy percentage.
+        dict: Training metrics for the epoch:
+            - `"loss"` (float): The average training loss.
+            - `"accuracy"` (float): Training accuracy as a percentage.
     """
     model.train()
     running_loss, correct_train, total_train = 0.0, 0, 0
@@ -768,19 +823,23 @@ def train_one_epoch(model, dataloader, optim_params, loss_params, config):
 
 
 def intersection_over_union(preds, labels):
-    """Compute the Intersection over Union (IoU) score.
+    """Compute the Intersection over Union (IoU) score for binary masks.
 
-    IoU measures the overlap between the predicted and ground truth masks. It is 
-    defined as the ratio of the intersection to the union of the two sets.
+    IoU measures the overlap between predicted and ground truth masks, used 
+    in image segmentation tasks. It is defined as the ratio of the intersection to 
+    the union of the two sets:
+
+        IoU = (intersection + ε) / (union + ε)
+
+    where ε = 1e-6 is a small constant added to prevent division by zero.
 
     Args:
         preds (torch.Tensor): The predicted binary mask of shape (N, C, H, W).
+                            If `preds` contains logits, thresholding should be applied.
         labels (torch.Tensor): The ground truth binary mask of shape (N, C, H, W).
 
     Returns:
-        torch.Tensor: The IoU score as a scalar tensor, computed as:
-            IoU = (intersection + 1e-6) / (union + 1e-6),
-        where a small epsilon (1e-6) is added to prevent division by zero.
+        torch.Tensor: Scalar IoU score representing the overlap between `preds` and `labels`.
     """
     intersection = (preds * labels).sum()
     union = preds.sum() + labels.sum() - intersection
@@ -788,23 +847,24 @@ def intersection_over_union(preds, labels):
 
 
 def dice_score(preds, labels):
-    """Compute the Dice coefficient score.
+    """Compute the Dice coefficient score for binary segmentation masks.
 
-    The Dice coefficient is a measure of overlap between two sets, commonly 
-    used for evaluating image segmentation models. It is defined as:
+    The Dice coefficient measures the similarity between predicted and ground truth masks, 
+    commonly used for evaluating segmentation models. It is defined as:
 
         Dice = (2 * |A ∩ B|) / (|A| + |B|)
 
-    where A is the predicted mask and B is the ground truth mask.
+    where A is the predicted mask and B is the ground truth mask. A small constant (ε = 1e-6) 
+    is added to prevent division by zero.
 
     Args:
         preds (torch.Tensor): The predicted binary mask of shape (N, C, H, W).
+                            If `preds` contains logits, thresholding should be applied.
         labels (torch.Tensor): The ground truth binary mask of shape (N, C, H, W).
 
     Returns:
-        torch.Tensor: The Dice coefficient score as a scalar tensor, computed as:
-            Dice = (2 * intersection + 1e-6) / (preds.sum() + labels.sum() + 1e-6),
-        where a small epsilon (1e-6) is added to prevent division by zero.
+        torch.Tensor: A scalar tensor representing the Dice coefficient score, ranging from 0 to 1.
+                    A higher score indicates better segmentation performance.
     """
     intersection = (preds * labels).sum()
     return (2 * intersection + 1e-6) / (preds.sum() + labels.sum() + 1e-6)
@@ -813,21 +873,21 @@ def dice_score(preds, labels):
 def evaluate_model(model, dataloader, evaluate_heatmap=False):
     """Evaluate the model for classification accuracy and optional heatmap metrics.
 
-    This function computes the **classification accuracy** for the given dataset. 
-    If `evaluate_heatmap` is enabled, it also calculates the **Intersection over Union (IoU)** 
-    and **Dice score** for the predicted heatmaps.
+    This function computes the **classification accuracy** of the model on the provided dataset.
+    If `evaluate_heatmap` is enabled, it also calculates **Intersection over Union (IoU)** 
+    and **Dice score** for the predicted heatmaps, which measure segmentation quality.
 
     Args:
         model (torch.nn.Module): The trained model to be evaluated.
         dataloader (torch.utils.data.DataLoader): DataLoader for the evaluation dataset.
-        evaluate_heatmap (bool, optional): If `True`, computes IoU and Dice score for heatmaps. 
+        evaluate_heatmap (bool, optional): Whether to compute segmentation metrics (IoU and Dice). 
             Defaults to `False`.
 
     Returns:
         tuple:
-            - image_accuracy (float): The classification accuracy in percentage.
-            - heatmap_metrics (tuple or None): A tuple `(iou, dice)` if `evaluate_heatmap=True`, 
-              otherwise `None`.
+            - float: The classification accuracy as a percentage.
+            - tuple[float, float] or None: If `evaluate_heatmap=True`, returns `(iou, dice)`, 
+              where both IoU and Dice scores are floats. Otherwise, returns `None`.
     """
     model.eval()
     correct, total = 0, 0
@@ -859,7 +919,32 @@ def evaluate_model(model, dataloader, evaluate_heatmap=False):
 
 
 def train_hyperparam_tuning(config, train_loader=None, val_loader=None):
-    """Train the model using hyperparameter tuning and report validation accuracy."""
+    """Train a CNN model with hyperparameter tuning and checkpointing.
+
+    This function trains a convolutional neural network while optimizing hyperparameters. 
+    It supports:
+    
+    - **Multiple optimizers**, selectable via `config["optimizer"]`.
+    - **Mixed-precision training** using `torch.amp.autocast` and gradient scaling.
+    - **Checkpointing** to resume training and store the best model state.
+    - **Validation accuracy tracking** to monitor performance.
+
+    Args:
+        config (dict): Training configuration, including:
+            - `"num_filters"` (int): Number of filters in the CNN model.
+            - `"dropout"` (float): Dropout rate for regularization.
+            - `"optimizer"` (str): Name of the optimizer (`adamw`, `adam`, `rmsprop`, etc.).
+            - `"learning_rate"` (float): Learning rate for the optimizer.
+            - `"weight_decay"` (float): L2 regularization factor.
+            - `"momentum"` (float, optional): Momentum (for SGD-based optimizers).
+            - `"num_epochs"` (int): Total training epochs.
+        train_loader (torch.utils.data.DataLoader, optional): DataLoader for the training dataset.
+        val_loader (torch.utils.data.DataLoader, optional): DataLoader for the validation dataset.
+
+    Returns:
+        None: Training results and validation accuracy are logged during execution.
+        Checkpoints are saved automatically to resume training if needed.
+    """
 
     model_instance = CNNModel(num_filters=config["num_filters"],
                               dropout=config["dropout"]).to(DEVICE)
@@ -905,7 +990,7 @@ def train_hyperparam_tuning(config, train_loader=None, val_loader=None):
         optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
         best_val_acc = checkpoint_data.get("best_val_acc", 0.0)
         start_epoch = checkpoint_data.get("epoch", 0) + 1
-        print(f"🔄 Resuming training from epoch {start_epoch}, best val_acc: {best_val_acc:.2f}")
+        print(f"Resuming training from epoch {start_epoch}, best val_acc: {best_val_acc:.2f}")
 
     for epoch in range(start_epoch, config["num_epochs"]):
         model_instance.train()
@@ -960,17 +1045,165 @@ def train_hyperparam_tuning(config, train_loader=None, val_loader=None):
         else:
             session.report({"val_acc": val_acc, "train_loss": avg_train_loss, "epoch": epoch})
 
+def plot_pca_features(features, labels, n_components=3):
+    """Plot PCA-transformed CNN features in 2D or 3D.
+
+    This function applies Principal Component Analysis (PCA) to reduce the 
+    dimensionality of CNN-extracted features and visualizes the transformed 
+    data. It supports both **2D (n_components=2)** and **3D (n_components=3)** plots.
+
+    Args:
+        features (np.ndarray or torch.Tensor): The extracted CNN features, 
+            with shape (N, D), where N is the number of samples, and D is the 
+            feature dimensionality.
+        labels (np.ndarray or torch.Tensor): Binary labels of shape (N,), 
+            where 0 represents "FAKE" and 1 represents "REAL".
+        n_components (int, optional): Number of principal components to retain. 
+            Must be either `2` or `3`. Defaults to `3`.
+
+    Raises:
+        ValueError: If `n_components` is not 2 or 3.
+
+    Returns:
+        None: Displays a 2D or 3D scatter plot of the PCA-transformed features.
+    """
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(features)
+    
+    explained_variance = pca.explained_variance_ratio_
+    print(f"Explained variance (first {n_components} PCs): {explained_variance}")
+    print(f"Total variance explained: {explained_variance.sum() * 100:.2f}%")
+
+    if n_components == 2:
+        plt.scatter(pca_result[labels==0, 0], pca_result[labels==0, 1], label='FAKE', alpha=0.6)
+        plt.scatter(pca_result[labels==1, 0], pca_result[labels==1, 1], label='REAL', alpha=0.6)
+        plt.xlabel('PC1')
+        plt.ylabel('PC2')
+        plt.title('2D PCA of CNN Features')
+        plt.legend()
+        plt.grid()
+        plt.show()
+    elif n_components == 3:
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(pca_result[labels==0, 0], pca_result[labels==0, 1], pca_result[labels==0, 2], label='FAKE', alpha=0.6)
+        ax.scatter(pca_result[labels==1, 0], pca_result[labels==1, 1], pca_result[labels==1, 2], label='REAL', alpha=0.6)
+        ax.set_xlabel('PC1')
+        ax.set_ylabel('PC2')
+        ax.set_zlabel('PC3')
+        ax.set_title('3D PCA of CNN Features')
+        ax.legend()
+        plt.show()
+        
+def plot_explained_variance(features, max_components=15):
+    """Plot the explained variance of principal components.
+
+    This function applies Principal Component Analysis (PCA) to the given features
+    and visualizes both the **individual explained variance** and the **cumulative 
+    explained variance** across the first `max_components` principal components.
+
+    Args:
+        features (np.ndarray or torch.Tensor): The extracted CNN features with 
+            shape (N, D), where N is the number of samples and D is the feature dimensionality.
+        max_components (int, optional): The number of principal components to consider.
+            Defaults to `15`.
+
+    Returns:
+        None: Displays a bar chart and a cumulative variance step plot.
+    """
+    pca = PCA(n_components=max_components)
+    pca.fit(features)
+    
+    explained_variance = pca.explained_variance_ratio_
+
+    plt.figure(figsize=(8,5))
+    plt.bar(range(1, max_components+1), explained_variance, alpha=0.6, label='Individual Explained Variance')
+    plt.step(range(1, max_components+1), np.cumsum(explained_variance), where='mid', color='red', label='Cumulative Explained Variance')
+    plt.xlabel('Principal Component')
+    plt.ylabel('Explained Variance Ratio')
+    plt.title('Explained Variance by Principal Components')
+    plt.xticks(range(1, max_components+1))
+    plt.legend()
+    plt.grid()
+    plt.show()
+    
+
+def plot_confusion_matrix(true_labels, predicted_labels, classes=['FAKE', 'REAL']):
+    """Plot a confusion matrix for classification results.
+
+    This function generates a confusion matrix visualization to assess the 
+    performance of a binary classification model. It displays the number of 
+    correctly and incorrectly classified samples.
+
+    Args:
+        true_labels (array-like): Ground truth labels of shape (N,).
+        predicted_labels (array-like): Model-predicted labels of shape (N,).
+        classes (list, optional): List of class names corresponding to label values.
+            Defaults to `['FAKE', 'REAL']`.
+
+    Returns:
+        None: Displays the confusion matrix plot.
+    """
+    cm = confusion_matrix(true_labels, predicted_labels)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=classes)
+    disp.plot(cmap=plt.cm.Blues, values_format='d')
+    plt.title('Confusion Matrix')
+    plt.grid(False)
+    plt.show()
+
+def plot_training_history(train_loss, val_loss, train_acc, val_acc):
+    """Plot the training history of loss and accuracy.
+
+    This function visualizes the training process by plotting:
+    
+    - **Training vs. Validation Loss** over epochs.
+    - **Training vs. Validation Accuracy** over epochs.
+
+    Args:
+        train_loss (list or np.ndarray): Training loss values per epoch.
+        val_loss (list or np.ndarray): Validation loss values per epoch.
+        train_acc (list or np.ndarray): Training accuracy values per epoch.
+        val_acc (list or np.ndarray): Validation accuracy values per epoch.
+
+    Returns:
+        None: Displays the training history plots.
+    """
+    epochs = range(1, len(train_loss)+1)
+
+    plt.figure(figsize=(14,5))
+
+    # Loss plot
+    plt.subplot(1,2,1)
+    plt.plot(epochs, train_loss, label='Train Loss')
+    plt.plot(epochs, val_loss, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training vs Validation Loss')
+    plt.legend()
+    plt.grid()
+
+    # Accuracy plot
+    plt.subplot(1,2,2)
+    plt.plot(epochs, train_acc, label='Train Accuracy')
+    plt.plot(epochs, val_acc, label='Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Training vs Validation Accuracy')
+    plt.legend()
+    plt.grid()
+
+    plt.tight_layout()
+    plt.show()
 
 def evaluate_model_with_metrics(model, dataloader, evaluate_heatmap=False):
-    """Evaluate the model on a dataset, computing classification and heatmap metrics.
+    """Evaluate a model on classification and optional segmentation metrics.
 
-    This function evaluates a trained model on a given dataset, computing:
+    This function assesses a trained model on a dataset, computing:
     
     - **Classification Metrics:** Accuracy, precision, recall, and F1-score.
-    - **Heatmap Metrics (Optional):** IoU, Dice score, pixel-wise accuracy, precision, recall, and F1-score.
+    - **Segmentation Metrics (Optional):** IoU, Dice score, and pixel-wise accuracy, precision, recall, and F1-score.
 
-    If `evaluate_heatmap=True`, the function also evaluates pixel-wise predictions 
-    for segmentation tasks.
+    If `evaluate_heatmap=True`, the function evaluates pixel-wise predictions for segmentation tasks.
 
     Args:
         model (torch.nn.Module): The trained model to be evaluated.
@@ -981,15 +1214,15 @@ def evaluate_model_with_metrics(model, dataloader, evaluate_heatmap=False):
     Returns:
         dict: A dictionary containing classification metrics:
             - `"accuracy"` (float): Image classification accuracy.
-            - `"precision"` (float): Precision score.
-            - `"recall"` (float): Recall score.
-            - `"f1"` (float): F1 score.
+            - `"precision"` (float): Classification precision score.
+            - `"recall"` (float): Classification recall score.
+            - `"f1"` (float): Classification F1-score.
 
         If `evaluate_heatmap=True`, returns an additional dictionary with pixel-wise segmentation metrics:
-            - `"accuracy"` (float): Pixel-wise accuracy.
+            - `"accuracy"` (float): Pixel-wise segmentation accuracy.
             - `"precision"` (float): Pixel-wise precision.
             - `"recall"` (float): Pixel-wise recall.
-            - `"f1"` (float): Pixel-wise F1 score.
+            - `"f1"` (float): Pixel-wise F1-score.
             - `"iou"` (float): Intersection over Union (IoU) score.
             - `"dice"` (float): Dice coefficient.
     """
@@ -1044,23 +1277,31 @@ def evaluate_model_with_metrics(model, dataloader, evaluate_heatmap=False):
 
 
 def visualize_with_gradcam(model, img_path, img_transform, colormap="jet_r", alpha_intensity=0.6):
-    """Overlay a Grad-CAM heatmap and decoder heatmap on the original image and display classification results.
+    """Overlay Grad-CAM and decoder heatmaps on an image and display classification results.
+
+    This function applies Grad-CAM to visualize class-specific activations and overlays 
+    both the **Grad-CAM heatmap** and the **decoder heatmap** on the original image. 
+    It enhances the decoder heatmap contrast using CLAHE and ensures proper normalization 
+    for clear visual overlays.
 
     Enhancements:
-        - Uses CLAHE to enhance the decoder heatmap contrast.
-        - Ensures proper normalization of both heatmaps.
-        - Provides clear visual overlays.
+        - Uses CLAHE to improve decoder heatmap contrast.
+        - Ensures correct normalization of both heatmaps.
+        - Overlays heatmaps with adjustable transparency.
 
     Args:
         model (torch.nn.Module): The trained CNN model for classification.
         img_path (str): Path to the input image.
-        img_transform (callable): Transformation function to preprocess the image.
-        colormap (str, optional): Colormap for the Grad-CAM and decoder heatmap overlays. Default is "jet".
-        alpha_intensity (float, optional): Weighting factor for blending the heatmaps with 
-            the original image. Default is 0.6.
+        img_transform (callable): Transformation function for preprocessing the image.
+        colormap (str, optional): Colormap for visualizing heatmaps. Default is `"jet_r"`.
+        alpha_intensity (float, optional): Transparency factor for blending heatmaps with 
+            the original image (range: 0-1). Default is `0.6`.
 
     Returns:
-        None: Displays the original image, the Grad-CAM heatmap overlay, and the decoder heatmap overlay.
+        None: Displays three images:
+            - The original image.
+            - The Grad-CAM overlay with classification results.
+            - The enhanced decoder heatmap overlay.
     """
     model.eval()
     original_img = Image.open(img_path).convert("RGB")
@@ -1076,30 +1317,41 @@ def visualize_with_gradcam(model, img_path, img_transform, colormap="jet_r", alp
     gradcam_heatmap = compute_gradcam(model, input_tensor)
 
     def process_heatmap(heatmap, img_shape, enhance_contrast=False):
-        """Preprocesses heatmap: normalizes, resizes, and optionally enhances contrast."""
+        """Process a heatmap for visualization.
+
+        This function converts a model-generated heatmap into a format suitable for display. 
+        It ensures the heatmap is correctly resized, normalized, and optionally enhances its 
+        contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization).
+
+        Args:
+            heatmap (torch.Tensor or np.ndarray): The input heatmap, which can be a PyTorch tensor 
+                or a NumPy array. If a tensor, it is converted to a NumPy array.
+            img_shape (tuple): Target image shape as (height, width) for resizing.
+            enhance_contrast (bool, optional): Whether to apply contrast enhancement using CLAHE.
+                Defaults to `False`.
+
+        Returns:
+            np.ndarray: A processed heatmap in RGB format, ready for visualization.
+        """
         if isinstance(heatmap, torch.Tensor):
             heatmap = heatmap.squeeze().detach().cpu().numpy()
         if heatmap.ndim > 2:
-            heatmap = np.mean(heatmap, axis=0)  # Average across channels if needed
+            heatmap = np.mean(heatmap, axis=0)
 
         heatmap = cv2.resize(heatmap, img_shape)
 
-        # Normalize to [0,1]
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-7)
 
-        # Apply CLAHE for decoder heatmap if enhance_contrast=True
         if enhance_contrast:
-            heatmap = np.uint8(255 * heatmap)  # Convert to 8-bit
+            heatmap = np.uint8(255 * heatmap)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            heatmap = clahe.apply(heatmap)  # Apply CLAHE
-            heatmap = heatmap / 255.0  # Convert back to [0,1]
+            heatmap = clahe.apply(heatmap)
+            heatmap = heatmap / 255.0
 
-        return plt.get_cmap(colormap)(heatmap)[..., :3]  # Apply colormap and remove alpha channel
+        return plt.get_cmap(colormap)(heatmap)[..., :3]
 
-    # Convert original image to NumPy for overlay blending
     original_img = np.array(original_img, dtype=np.float64) / 255.0
 
-    # Process both Grad-CAM and decoder heatmaps
     gradcam_overlay = (1 - alpha_intensity) * original_img + alpha_intensity * process_heatmap(
         gradcam_heatmap, (original_img.shape[1], original_img.shape[0])
     )
@@ -1108,10 +1360,6 @@ def visualize_with_gradcam(model, img_path, img_transform, colormap="jet_r", alp
         decoder_heatmap.squeeze().cpu().numpy(), (original_img.shape[1], original_img.shape[0]), enhance_contrast=True
     )
 
-    # Debugging: Print heatmap values
-    print("Decoder Heatmap After Enhancement:\n", decoder_heatmap)
-
-    # Display results
     fig, ax = plt.subplots(1, 3, figsize=(18, 6))
     ax[0].imshow(original_img)
     ax[0].set_title("Original Image")
@@ -1133,101 +1381,145 @@ if __name__ == "__main__":
     LABELS_CSV = "/home/pie_crusher/CNN_AI_REAL/labels.csv"
     IMAGE_DIRECTORY = "/home/pie_crusher/CNN_AI_REAL/image_directory"
 
-    # Check if --skip-main is present
+    # Skip training if "--skip-main" argument is provided and load a pre-trained model
     if "--skip-main" in sys.argv:
-        # Get argument values by finding named argument indices
         try:
+            # Retrieve checkpoint and parameters file paths from command-line arguments
             checkpoint_index = sys.argv.index("--checkpoint-path") + 1
             params_index = sys.argv.index("--params-path") + 1
 
             CHECKPOINT_PATH = sys.argv[checkpoint_index]
             PARAMS_PATH = sys.argv[params_index]
         except (ValueError, IndexError):
-            print("Error: Missing required arguments. Usage:")
-            print("python image_encoder_decoder.py --skip-main --checkpoint-path <checkpoint_path> --params-path <params_path>")
+            print("Error: Missing arguments.")
             sys.exit(1)
 
-        # Validate file paths
-        if not os.path.exists(CHECKPOINT_PATH):
-            print(f"Error: Checkpoint file '{CHECKPOINT_PATH}' not found.")
+        # Ensure the checkpoint and parameter files exist
+        if not os.path.exists(CHECKPOINT_PATH) or not os.path.exists(PARAMS_PATH):
+            print("Checkpoint or params file missing.")
             sys.exit(1)
 
-        if not os.path.exists(PARAMS_PATH):
-            print(f"Error: Params file '{PARAMS_PATH}' not found.")
-            sys.exit(1)
-
-        # Load hyperparameters from params.json
+        # Load hyperparameters from the provided JSON file
         with open(PARAMS_PATH, "r") as f:
             best_config = json.load(f)
 
-        # Extract model configuration
         DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Initialize model following the provided template
-        cnn_model = CNNModel(
-            num_filters=best_config["num_filters"], 
-            dropout=best_config["dropout"]
-        ).to(DEVICE)
+        # Initialize model with the best hyperparameters
+        cnn_model = CNNModel(num_filters=best_config["num_filters"], dropout=best_config["dropout"]).to(DEVICE)
 
-        # Load model weights from the fine-tuned checkpoint
-        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        # Load model checkpoint with training history
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=False)
         cnn_model.load_state_dict(checkpoint["model_state_dict"])
         cnn_model.eval()
 
-        print(f"Loaded fine-tuned model from: {CHECKPOINT_PATH}")
+        print(f"Loaded model from: {CHECKPOINT_PATH}")
         print(f"Validation Accuracy: {checkpoint.get('val_acc', 'N/A'):.2f}%")
 
-        # Select a random image for testing
-        IMAGE_DIR = "/home/pie_crusher/CNN_AI_REAL/image_directory"
-        image_files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith((".jpg"))]
-        if not image_files:
-            print(f"Error: No images found in {IMAGE_DIR}")
-            sys.exit(1)
+        # Plot training history if available
+        if "history" in checkpoint:
+            history = checkpoint["history"]
+            print("Plotting Training History...")
+            plot_training_history(
+                history["train_loss"], 
+                history["val_loss"], 
+                history["train_acc"], 
+                history["val_acc"]
+            )
+        else:
+            print("No training history found in checkpoint. Skipping history plot.")
 
-        TEST_IMAGE_PATH = os.path.join(IMAGE_DIR, random.choice(image_files))
-#        TEST_IMAGE_PATH = 'fake.jpg' #Custom Image Path
-        print(f"Selected Random Image: {TEST_IMAGE_PATH}")
+        # Load test dataset from checkpoint if available, otherwise create a new dataset
+        if "test_dataset" in checkpoint:
+            test_dataset = checkpoint["test_dataset"]
+            print("Loaded test dataset from checkpoint.")
+        else:
+            print("No test dataset found in checkpoint. Using default dataset.")
+            test_dataset = CustomDataset(LABELS_CSV, IMAGE_DIRECTORY, image_transform=transform)
 
-        # Perform Grad-CAM visualization
-        visualize_with_gradcam(
-            cnn_model, TEST_IMAGE_PATH, inference_transform, colormap="jet_r", alpha_intensity=0.9
+        # Set up test DataLoader
+        BATCH_SIZE = 64
+        num_workers = min(4, os.cpu_count() - 1)
+
+        test_data_loader = DataLoader(
+            test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=num_workers, pin_memory=True,
+            persistent_workers=(num_workers > 0), prefetch_factor=2, drop_last=False
         )
 
-        sys.exit(0)  # Exit after inference is complete
+        print("Test DataLoader rebuilt successfully.")
 
+        # Evaluate the model on the test set
+        test_metrics = evaluate_model_with_metrics(cnn_model, test_data_loader)
 
+        # Extract CNN features for PCA and confusion matrix analysis
+        all_features, all_labels, all_preds = [], [], []
+        with torch.no_grad():
+            for images, labels in test_data_loader:
+                images = images.to(DEVICE)
+                feats, _ = cnn_model(images, train_decoder=False)
+
+                # Extract global features from the model
+                global_feats = cnn_model.global_pool(
+                    cnn_model.conv2(
+                        cnn_model.pool1(cnn_model.silu1(cnn_model.conv1(images)))
+                    )
+                ).view(images.size(0), -1).cpu().numpy()
+
+                # Obtain classification predictions
+                preds = torch.sigmoid(feats).round().cpu().numpy()
+
+                all_features.append(global_feats)
+                all_labels.append(labels.numpy())
+                all_preds.append(preds)
+
+        # Convert lists to numpy arrays
+        all_features = np.concatenate(all_features)
+        all_labels = np.concatenate(all_labels)
+        all_preds = np.concatenate(all_preds)
+
+        # Visualize PCA projections and explained variance
+        plot_pca_features(all_features, all_labels, n_components=2)
+        plot_pca_features(all_features, all_labels, n_components=3)
+        plot_explained_variance(all_features, max_components=15)
+
+        # Generate confusion matrix
+        plot_confusion_matrix(all_labels, all_preds)
+
+        # Select a random image from the dataset and visualize Grad-CAM
+        TEST_IMAGE_PATH = os.path.join(IMAGE_DIRECTORY, random.choice(os.listdir(IMAGE_DIRECTORY)))
+        print(f"Visualizing Grad-CAM for image: {TEST_IMAGE_PATH}")
+        visualize_with_gradcam(cnn_model, TEST_IMAGE_PATH, inference_transform, colormap="jet_r", alpha_intensity=0.9)
+
+        sys.exit(0)
+
+    # Initialize the dataset and apply transformations
     dataset = CustomDataset(LABELS_CSV, IMAGE_DIRECTORY, image_transform=transform)
 
+    # Split dataset into training (80%), validation (10%), and test (10%) sets
     train_size = int(0.8 * len(dataset))
     val_size = int(0.1 * len(dataset))
     test_size = len(dataset) - train_size - val_size
-    train_dataset, val_dataset, test_dataset = random_split(
-        dataset, [train_size, val_size, test_size]
-    )
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
 
-
+    # Define batch size and set number of workers for parallel data loading
     BATCH_SIZE = 64
-    num_workers = min(4, os.cpu_count() - 1)
+    num_workers = min(4, os.cpu_count() - 1)  # Ensure efficient parallel processing
 
-    train_data_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0), prefetch_factor=2,
-         drop_last=True
-    )
-    val_data_loader = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0), prefetch_factor=2,
-         drop_last=True
-    )
-    test_data_loader = DataLoader(
-        test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0), prefetch_factor=2,
-         drop_last=True
-    )
+    # Create data loaders for training, validation, and testing
+    train_data_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                num_workers=num_workers, pin_memory=True,
+                                persistent_workers=(num_workers > 0), prefetch_factor=2, drop_last=True)
 
+    val_data_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=num_workers, pin_memory=True,
+                                persistent_workers=(num_workers > 0), prefetch_factor=2, drop_last=True)
+
+    test_data_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=num_workers, pin_memory=True,
+                                persistent_workers=(num_workers > 0), prefetch_factor=2, drop_last=True)
+
+    # Define the hyperparameter search space for tuning
     search_space = {
         "optimizer": tune.choice(["adamw", "adam", "rmsprop", "sgd", "nadam", "adagrad"]),
 
@@ -1247,10 +1539,11 @@ if __name__ == "__main__":
         "num_epochs": tune.choice([10, 15, 20, 25, 30, 50]),
 
         "momentum": tune.sample_from(
-    lambda config: float(np.random.uniform(0.6, 0.98)) if config["optimizer"] == "sgd" else 0.0)
+            lambda config: float(np.random.uniform(0.6, 0.98)) if config["optimizer"] == "sgd" else 0.0
+        )
+    }
 
-        }
-
+    # If debug mode is enabled, skip hyperparameter tuning and use a predefined config
     if DEBUG_MODE:
         best_config = {
             "num_filters": 32,
@@ -1264,14 +1557,16 @@ if __name__ == "__main__":
         print("Debug mode ON: Skipping hyperparameter tuning. Using fixed config:", best_config)
 
     else:
+        # Define ASHA scheduler for efficient hyperparameter search
         scheduler = ASHAScheduler(
             metric="val_acc",
             mode="max",
-            max_t=25,
+            max_t=50,
             grace_period=5,
             reduction_factor=3
         )
 
+        # Run hyperparameter tuning using Ray Tune
         tuner = tune.run(
             tune.with_parameters(
                 train_hyperparam_tuning,
@@ -1288,17 +1583,21 @@ if __name__ == "__main__":
             resume="Auto"
         )
 
+        # Retrieve the best trial configuration from tuning
         best_trial = tuner.get_best_trial("val_acc", "max", "last")
         best_config = best_trial.config
         print("Hyperparameter tuning complete. Best config:", best_config)
 
+        # Load the best model checkpoint if available
         best_checkpoint = tuner.get_best_checkpoint(best_trial, metric="val_acc", mode="max")
 
+        # Initialize model with best hyperparameters
         best_model = CNNModel(
             num_filters=best_config["num_filters"],
             dropout=best_config["dropout"]
         ).to(DEVICE)
 
+        # Load model state from the best checkpoint
         if best_checkpoint:
             best_model_path = os.path.join(best_checkpoint.to_directory(), "checkpoint.pth")
 
@@ -1309,39 +1608,43 @@ if __name__ == "__main__":
             else:
                 best_checkpoint = None
 
+        # If no valid checkpoint is found, retrain the model
         if best_checkpoint is None:
             print("No valid checkpoint found. Training model again.")
-            best_model_state_dict, _ = train_model(
-                best_model,
+            best_model, best_val_acc, history = train_model(
+                CNNModel(num_filters=best_config["num_filters"], dropout=best_config["dropout"]).to(DEVICE),
                 train_loader=train_data_loader,
                 val_loader=val_data_loader,
                 config=best_config
             )
+            best_model_state_dict = best_model.state_dict()
             best_model.load_state_dict(best_model_state_dict)
 
+        # Evaluate the best model on the test set
         best_model.eval()
         test_metrics = evaluate_model_with_metrics(best_model, test_data_loader)
 
-    best_model, best_val_acc = train_model(
-        CNNModel(
-            num_filters=best_config["num_filters"], dropout=best_config["dropout"]
-        ).to(DEVICE),
+    # Train the final model using the best configuration found
+    best_model, best_val_acc, history = train_model(
+        CNNModel(num_filters=best_config["num_filters"], dropout=best_config["dropout"]).to(DEVICE),
         train_loader=train_data_loader,
         val_loader=val_data_loader,
         config=best_config
     )
 
-
+    # Save the best-trained model along with metadata
     torch.save({
-        "model_state_dict": best_model,
+        "model_state_dict": best_model.state_dict(),
         "val_acc": best_val_acc,
         "config": best_config,
         "num_epochs": best_config["num_epochs"],
+        "history": history,
+        "test_dataset": test_dataset
     }, "best_cnn_real_fake.pth")
 
     print("Best model saved successfully!")
 
-
+    # Reload the saved model for further evaluation
     checkpoint = torch.load("best_cnn_real_fake.pth")
     cnn_model = CNNModel(
         num_filters=best_config["num_filters"], dropout=best_config["dropout"]
@@ -1349,6 +1652,7 @@ if __name__ == "__main__":
     cnn_model.load_state_dict(checkpoint["model_state_dict"])
     cnn_model.to(DEVICE)
 
+    # Display summary of the best model
     best_val_acc = checkpoint["val_acc"]
     hyperparams = checkpoint["config"]
     num_epochs = checkpoint["num_epochs"]
@@ -1357,13 +1661,14 @@ if __name__ == "__main__":
     print(f"Hyperparameters used: {hyperparams}")
     print(f"Trained for {num_epochs} epochs")
 
-
+    # Evaluate the final model on the test dataset
     test_metrics = evaluate_model_with_metrics(cnn_model, test_data_loader)
     test_accuracy, test_precision, test_recall, test_f1 = test_metrics
 
-
+    # Select a random image from the test dataset for Grad-CAM visualization
     random_idx = random.randint(0, len(test_dataset) - 1)
     image_path = os.path.join(IMAGE_DIRECTORY, dataset.img_labels.iloc[random_idx, 0])
     print(f"Visualizing heatmap for: {image_path}")
 
+    # Generate and display Grad-CAM heatmap for the selected image
     visualize_with_gradcam(cnn_model, image_path, inference_transform)
